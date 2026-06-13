@@ -968,7 +968,12 @@ const SUPABASE_ANON_KEY = "sb_publishable_qZYnXPU66cCVlMSBE7WgTQ_Fj2LfkIN";
 // ==========================================
 const { createClient } = supabase;
 const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-  auth: { persistSession: true, autoRefreshToken: true }
+  auth: { persistSession: true, autoRefreshToken: true },
+  realtime: {
+    params: { eventsPerSecond: 10 },
+    heartbeatIntervalMs: 15000,
+    reconnectAfterMs: (tries) => Math.min(tries * 1000, 10000)
+  }
 });
 
 // ==========================================
@@ -1385,7 +1390,8 @@ async function afterLogin() {
 
 async function handleLogout() {
   closeModal();
-  await sb.from('profiles').update({ is_online: false, last_seen: new Date().toISOString(), presence_status: 'offline' }).eq('id', currentUser.id);
+  try { await sb.from('profiles').update({ is_online: false, last_seen: new Date().toISOString(), presence_status: 'offline' }).eq('id', currentUser.id); } catch(e) {}
+  cleanupPresence();
   cleanupRealtime();
   await sb.auth.signOut();
   currentUser = null; currentProfile = null;
@@ -1393,6 +1399,7 @@ async function handleLogout() {
   document.getElementById('app').style.display = 'none';
   // Reset state
   messages = []; chats = {};
+  offlineQueue = [];
 }
 
 // ==========================================
@@ -1459,6 +1466,8 @@ async function init() {
         loadCallHistory();
         loadBlockedUsers();
         setupPresence();
+        setupOfflineQueue();
+        setupBackHandler();
       } else {
         showScreen('auth-screen');
       }
@@ -1558,24 +1567,29 @@ function switchTab(tab) {
 // CHATS
 // ==========================================
 async function loadChats() {
-  // Load all messages involving me, get unique partners
-  const { data, error } = await sb.from('messages')
-    .select(`*, sender:profiles!messages_sender_id_fkey(id,username,avatar_url,is_online,last_seen), receiver:profiles!messages_receiver_id_fkey(id,username,avatar_url,is_online,last_seen)`)
-    .or(`sender_id.eq.${currentUser.id},receiver_id.eq.${currentUser.id}`)
-    .order('created_at', { ascending: false });
-  if (error) { console.error(error); return; }
-  // Build chats map
-  const chatMap = {};
-  (data||[]).forEach(msg => {
-    const partnerId = msg.sender_id === currentUser.id ? msg.receiver_id : msg.sender_id;
-    const partner = msg.sender_id === currentUser.id ? msg.receiver : msg.sender;
-    if (!chatMap[partnerId]) {
-      chatMap[partnerId] = { profile: partner, lastMsg: msg, unread: 0, pinned: false, archived: false };
-    }
-    if (msg.sender_id !== currentUser.id && msg.status !== 'read') chatMap[partnerId].unread++;
-  });
-  chats = chatMap;
-  renderChatsList();
+  try {
+    const { data, error } = await sb.from('messages')
+      .select('id,sender_id,receiver_id,content,msg_type,status,created_at,is_deleted,sender:profiles!messages_sender_id_fkey(id,username,avatar_url,is_online,last_seen),receiver:profiles!messages_receiver_id_fkey(id,username,avatar_url,is_online,last_seen)')
+      .or(`sender_id.eq.${currentUser.id},receiver_id.eq.${currentUser.id}`)
+      .order('created_at', { ascending: false })
+      .limit(200);
+    if (error) { console.error('[loadChats]', error); return; }
+    const chatMap = {};
+    (data||[]).forEach(msg => {
+      const partnerId = msg.sender_id === currentUser.id ? msg.receiver_id : msg.sender_id;
+      const partner   = msg.sender_id === currentUser.id ? msg.receiver   : msg.sender;
+      if (!chatMap[partnerId]) {
+        chatMap[partnerId] = {
+          profile: partner, lastMsg: msg, unread: 0,
+          pinned: chats[partnerId]?.pinned || false,
+          archived: chats[partnerId]?.archived || false
+        };
+      }
+      if (msg.sender_id !== currentUser.id && msg.status !== 'read') chatMap[partnerId].unread++;
+    });
+    chats = chatMap;
+    renderChatsList();
+  } catch(e) { console.error('[loadChats]', e); }
 }
 
 function renderChatsList() {
@@ -1634,7 +1648,11 @@ function updateNavBadge(arr) {
   badge.classList.toggle('hidden', total === 0);
 }
 
+let _openChatLock = false;
 async function openChat(userId) {
+  if (_openChatLock) return;
+  _openChatLock = true;
+  try {
   currentChatUserId = userId;
   const { data: prof } = await sb.from('profiles').select('*').eq('id', userId).single();
   currentChatProfile = prof;
@@ -1648,6 +1666,7 @@ async function openChat(userId) {
   await loadMessages(userId);
   markMessagesRead(userId);
   setupChatRealtime(userId);
+  } catch(e) { console.error('[openChat]', e); } finally { _openChatLock = false; }
 }
 
 function updateChatStatus() {
@@ -1671,14 +1690,16 @@ function updateChatStatus() {
 function closeChatView() {
   document.getElementById('chat-view').classList.remove('open');
   document.getElementById('main-screen').classList.remove('slide-left');
+  sendTypingStatus(false);
   currentChatUserId = null;
   currentChatProfile = null;
   clearReply();
-  sendTypingStatus(false);
   // Unsubscribe from chat-specific realtime
   realtimeSubs.filter(s => s._isChatSub).forEach(s => { try { sb.removeChannel(s); } catch(e){} });
   realtimeSubs = realtimeSubs.filter(s => !s._isChatSub);
-  loadChats();
+  // Refresh chats list from already-loaded data (fast) then background fetch
+  renderChatsList();
+  setTimeout(loadChats, 300);
 }
 
 async function loadMessages(userId) {
@@ -1691,9 +1712,10 @@ async function loadMessages(userId) {
   let loaded = false;
 
   //  Try loading from IndexedDB first (instant) 
+  const _loadingForUserId = userId;
   if (typeof idbGetAll === 'function') {
     idbGetAll((cached) => {
-      if (loaded) return;
+      if (loaded || currentChatUserId !== _loadingForUserId) return;
       const relevant = (cached || []).filter(m =>
         (m.sender_id === currentUser.id && m.receiver_id === userId) ||
         (m.sender_id === userId && m.receiver_id === currentUser.id)
@@ -1727,6 +1749,7 @@ async function loadMessages(userId) {
       messages = data || [];
     }
 
+    if (currentChatUserId !== _loadingForUserId) return; // user switched chats
     loaded = true;
     messages.forEach(m => idbPut(m));
     renderMessages();
@@ -1763,8 +1786,11 @@ function renderMessages() {
     }
     html += renderMessageBubble(msg);
   });
+  // Preserve scroll position: auto-scroll only when near bottom
+  const wasNearBottom = mc.scrollHeight - mc.scrollTop - mc.clientHeight < 120;
   mc.innerHTML = html;
-  mc.scrollTop = mc.scrollHeight;
+  if (wasNearBottom) mc.scrollTop = mc.scrollHeight;
+  // initSwipeToReply is idempotent (checks _swipeInit flag) — safe to call
   initSwipeToReply();
 }
 
@@ -1824,10 +1850,16 @@ function showPinnedMessage(msg) {
 }
 
 async function markMessagesRead(userId) {
-  await sb.from('messages').update({ status: 'read' })
-    .eq('sender_id', userId).eq('receiver_id', currentUser.id).neq('status','read');
+  if (!userId || !currentUser) return;
   if (chats[userId]) chats[userId].unread = 0;
-  renderChatsList();
+  // Update badge immediately without full re-render
+  const chatEl = document.getElementById('chat-item-' + userId);
+  if (chatEl) { const badge = chatEl.querySelector('.chat-badge'); if (badge) badge.remove(); }
+  updateNavBadge(Object.entries(chats));
+  // Fire DB update in background
+  sb.from('messages').update({ status: 'read' })
+    .eq('sender_id', userId).eq('receiver_id', currentUser.id).neq('status', 'read')
+    .then(() => {}).catch(() => {});
 }
 
 // ==========================================
@@ -1877,9 +1909,12 @@ async function sendMessage(overrideContent, overrideType, mediaUrl, mediaName, m
     if (error) throw error;
     const idx = messages.findIndex(m => m.id === msgData.id);
     if (idx !== -1) messages[idx] = { ...data, reply: replyRef };
-    renderMessages();
-    if (!chats[currentChatUserId]) chats[currentChatUserId] = { profile: currentChatProfile, unread: 0 };
-    chats[currentChatUserId].lastMsg = data; renderChatsList(); playMsgSound();
+    idbPut(messages[idx] || data);
+    debouncedRenderMessages();
+    if (!chats[currentChatUserId]) chats[currentChatUserId] = { profile: currentChatProfile, unread: 0, pinned: false, archived: false };
+    chats[currentChatUserId].lastMsg = data;
+    debouncedRenderChats();
+    playMsgSound();
   } catch(e) {
     // Queue for retry
     offlineQueue.push({ ...msgData }); saveOfflineQueue();
@@ -1910,11 +1945,14 @@ function onMsgKeydown(e) {
   }
 }
 
-async function sendTypingStatus(typing) {
+function sendTypingStatus(typing) {
   if (!currentChatUserId || !currentUser) return;
   if (typing === isTyping) return;
   isTyping = typing;
-  await sb.from('typing_status').upsert({ user_id: currentUser.id, chat_with: currentChatUserId, is_typing: typing, updated_at: new Date().toISOString() }, { onConflict: 'user_id,chat_with' });
+  // Fire-and-forget — never block the UI for typing status
+  sb.from('typing_status')
+    .upsert({ user_id: currentUser.id, chat_with: currentChatUserId, is_typing: typing, updated_at: new Date().toISOString() }, { onConflict: 'user_id,chat_with' })
+    .then(() => {}).catch(() => {});
 }
 
 // ==========================================
@@ -1996,14 +2034,13 @@ async function pinMsg(msgId) {
   const msg = messages.find(m => m.id === msgId);
   if (!msg) return;
   const newPin = !msg.is_pinned;
-  await sb.from('messages').update({ is_pinned: newPin }).eq('id', msgId);
-  // Unpin all others
+  // Unpin all in this conversation first, then pin the target
   if (newPin) {
     await sb.from('messages').update({ is_pinned: false })
-      .or(`and(sender_id.eq.${currentUser.id},receiver_id.eq.${currentChatUserId}),and(sender_id.eq.${currentChatUserId},receiver_id.eq.${currentUser.id})`)
-      .neq('id', msgId);
-    messages.forEach(m => { if (m.id !== msgId) m.is_pinned = false; });
+      .or(`and(sender_id.eq.${currentUser.id},receiver_id.eq.${currentChatUserId}),and(sender_id.eq.${currentChatUserId},receiver_id.eq.${currentUser.id})`);
+    messages.forEach(m => { m.is_pinned = false; });
   }
+  await sb.from('messages').update({ is_pinned: newPin }).eq('id', msgId);
   msg.is_pinned = newPin;
   if (newPin) showPinnedMessage(msg);
   else document.getElementById('pinned-message-bar').classList.add('hidden');
@@ -2861,6 +2898,7 @@ function _subscribeGlobal() {
 function _onSubStatus(name, status, err) {
   if (status === 'SUBSCRIBED') {
     _rtRetryCount = 0;
+    _rtHeartbeatFails = 0;
     _showRtStatus('connected');
   } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
     console.warn('[RT] ' + name + ' channel ' + status, err);
@@ -2970,28 +3008,48 @@ function cleanupRealtime() {
   realtimeSubs = [];
 }
 
+let _renderMsgsTimer = null;
+let _renderChatsTimer = null;
+function debouncedRenderMessages() {
+  clearTimeout(_renderMsgsTimer);
+  _renderMsgsTimer = setTimeout(renderMessages, 60);
+}
+function debouncedRenderChats() {
+  clearTimeout(_renderChatsTimer);
+  _renderChatsTimer = setTimeout(renderChatsList, 80);
+}
+
 async function handleNewMessage(msg) {
+  // Dedupe
+  if (messages.find(m => m.id === msg.id)) return;
+
   // If currently in that chat
   if (currentChatUserId && (msg.sender_id === currentChatUserId || msg.receiver_id === currentChatUserId)) {
-    if (!messages.find(m => m.id === msg.id)) {
-      messages.push(msg);
-      renderMessages();
-      markMessagesRead(currentChatUserId);
-    }
+    messages.push(msg);
+    idbPut(msg);
+    debouncedRenderMessages();
+    // Update chats list preview too
+    const partnerId = msg.sender_id === currentUser.id ? msg.receiver_id : msg.sender_id;
+    if (chats[partnerId]) { chats[partnerId].lastMsg = msg; debouncedRenderChats(); }
+    markMessagesRead(currentChatUserId);
     return;
   }
   // Update chats list
   const senderId = msg.sender_id;
   if (!chats[senderId]) {
-    const { data: prof } = await sb.from('profiles').select('*').eq('id', senderId).single();
-    chats[senderId] = { profile: prof, lastMsg: msg, unread: 0 };
+    try {
+      const { data: prof } = await sb.from('profiles').select('id,username,avatar_url,is_online,last_seen').eq('id', senderId).single();
+      chats[senderId] = { profile: prof, lastMsg: msg, unread: 0, pinned: false, archived: false };
+    } catch(e) {
+      chats[senderId] = { profile: null, lastMsg: msg, unread: 0, pinned: false, archived: false };
+    }
   }
   chats[senderId].lastMsg = msg;
   chats[senderId].unread = (chats[senderId].unread || 0) + 1;
-  renderChatsList();
-  // Mark delivered
-  await sb.from('messages').update({ status: 'delivered' }).eq('id', msg.id);
-  // Notification
+  debouncedRenderChats();
+  // Mark delivered (fire-and-forget — don't block)
+  sb.from('messages').update({ status: 'delivered' }).eq('id', msg.id).then(() => {}).catch(() => {});
+  // Notification + sound
   sendBrowserNotif(msg);
   playMsgSound();
   if (settings.vibration && navigator.vibrate) navigator.vibrate(100);
@@ -2999,7 +3057,7 @@ async function handleNewMessage(msg) {
 
 function handleMsgUpdate(msg) {
   const idx = messages.findIndex(m => m.id === msg.id);
-  if (idx !== -1) { messages[idx] = { ...messages[idx], ...msg }; renderMessages(); }
+  if (idx !== -1) { messages[idx] = { ...messages[idx], ...msg }; debouncedRenderMessages(); }
 }
 // alias
 function handleMessageUpdate(msg) { handleMsgUpdate(msg); }
@@ -3008,7 +3066,15 @@ function updateTypingIndicator(typing) {
   const el = document.getElementById('chat-topbar-status');
   if (typing) { el.textContent = 'typing...'; el.style.color = 'var(--accent)'; }
   else { updateChatStatus(); }
-  if (chats[currentChatUserId]) { chats[currentChatUserId].isTyping = typing; renderChatsList(); }
+  if (chats[currentChatUserId]) {
+    chats[currentChatUserId].isTyping = typing;
+    // Only update the last-message line in the chat list item, not full re-render
+    const chatEl = document.getElementById('chat-item-' + currentChatUserId);
+    if (chatEl) {
+      const lastRow = chatEl.querySelector('.chat-last-msg');
+      if (lastRow) lastRow.innerHTML = typing ? '<span class="typing-text">typing...</span>' : (chats[currentChatUserId].lastMsg?.content ? sanitize(chats[currentChatUserId].lastMsg.content).substring(0,40) : '');
+    }
+  }
 }
 
 function sendBrowserNotif(msg) {
@@ -3039,16 +3105,34 @@ function playMsgSound() {
   } catch(e) {}
 }
 
+let _presenceInterval = null;
+let _visibilityHandler = null;
+
 function setupPresence() {
-  // Keep updating presence
-  setInterval(async () => {
-    if (currentUser) await sb.from('profiles').update({ is_online: true, last_seen: new Date().toISOString() }).eq('id', currentUser.id);
+  // Clear any previous presence listeners to avoid duplicates
+  if (_presenceInterval) { clearInterval(_presenceInterval); _presenceInterval = null; }
+  if (_visibilityHandler) { document.removeEventListener('visibilitychange', _visibilityHandler); _visibilityHandler = null; }
+
+  _presenceInterval = setInterval(() => {
+    if (currentUser && !document.hidden) {
+      sb.from('profiles').update({ is_online: true, last_seen: new Date().toISOString() }).eq('id', currentUser.id).then(()=>{}).catch(()=>{});
+    }
   }, 30000);
-  // On page hide
-  document.addEventListener('visibilitychange', async () => {
-    if (document.hidden && currentUser) await sb.from('profiles').update({ is_online: false, last_seen: new Date().toISOString(), presence_status: 'away' }).eq('id', currentUser.id);
-    else if (!document.hidden && currentUser) await sb.from('profiles').update({ is_online: true, presence_status: 'online' }).eq('id', currentUser.id);
-  });
+
+  _visibilityHandler = () => {
+    if (!currentUser) return;
+    if (document.hidden) {
+      sb.from('profiles').update({ is_online: false, last_seen: new Date().toISOString(), presence_status: 'away' }).eq('id', currentUser.id).then(()=>{}).catch(()=>{});
+    } else {
+      sb.from('profiles').update({ is_online: true, presence_status: 'online' }).eq('id', currentUser.id).then(()=>{}).catch(()=>{});
+    }
+  };
+  document.addEventListener('visibilitychange', _visibilityHandler);
+}
+
+function cleanupPresence() {
+  if (_presenceInterval) { clearInterval(_presenceInterval); _presenceInterval = null; }
+  if (_visibilityHandler) { document.removeEventListener('visibilitychange', _visibilityHandler); _visibilityHandler = null; }
 }
 
 // ==========================================
@@ -3738,15 +3822,16 @@ async function flushOfflineQueue() {
         created_at: msg.created_at,
         is_edited: false, is_deleted: false, is_pinned: false
       }).select().single();
-      if (!error && data && currentChatUserId === msg.receiver_id) {
+      if (error) { offlineQueue.push(msg); saveOfflineQueue(); continue; }
+      if (data && currentChatUserId === msg.receiver_id) {
         const idx = messages.findIndex(m => m.id === msg.id);
         if (idx !== -1) messages[idx] = { ...data, reply: msg.reply };
-        renderMessages();
+        debouncedRenderMessages();
       }
       if (data) {
-        if (!chats[msg.receiver_id]) chats[msg.receiver_id] = { profile: null, unread: 0 };
+        if (!chats[msg.receiver_id]) chats[msg.receiver_id] = { profile: null, unread: 0, pinned: false, archived: false };
         chats[msg.receiver_id].lastMsg = data;
-        renderChatsList();
+        debouncedRenderChats();
       }
     } catch(e) {
       offlineQueue.push(msg); saveOfflineQueue();
